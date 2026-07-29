@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+
+	"github.com/TylerPetri/kvstore/internal/raft"
 )
 
 type Request struct {
@@ -20,6 +22,7 @@ type Response struct {
 type Engine struct {
 	store   *Store
 	log     Log
+	raft    *raft.Node // nil means single-node mode
 	reqCh   chan Request
 	workers int
 	wg      sync.WaitGroup
@@ -44,6 +47,12 @@ func NewEngineWithLog(workers int, log Log) *Engine {
 	return e
 }
 
+func NewEngineWithRaft(workers int, n *raft.Node) *Engine {
+	e := NewEngine(workers)
+	e.raft = n
+	return e
+}
+
 func (e *Engine) Start(ctx context.Context) {
 	for i := 0; i < e.workers; i++ {
 		e.wg.Add(1)
@@ -62,30 +71,44 @@ func (e *Engine) worker(ctx context.Context) {
 				return
 			}
 
-			var val string
+			var resp Response
 
-			if e.log != nil {
-				entry := Entry{Cmd: req.Cmd}
-				_, err := e.log.Append(entry)
+			switch {
+			case e.raft != nil && (req.Cmd.Op == "set" || req.Cmd.Op == "delete"):
+				_, err := e.raft.Propose(req.Cmd)
 				if err != nil {
-					req.Response <- Response{Err: err}
-					continue
+					resp.Err = err
+				} else {
+					resp.OK = true
+					if req.Cmd.Op == "set" {
+						e.sets.Add(1)
+					} else {
+						e.deletes.Add(1)
+					}
 				}
-				val, ok = e.store.Apply(req.Cmd) // later will only happen after a commit (real RAFT implementation)
-			} else {
-				val, ok = e.store.Apply(req.Cmd)
+
+			case e.log != nil:
+				// legacy memory-log path
+				_, err := e.log.Append(Entry{Cmd: req.Cmd})
+				if err != nil {
+					resp.Err = err
+				} else {
+					val, ok := e.store.Apply(req.Cmd)
+					resp.Value = val
+					resp.OK = ok
+				}
+
+			default:
+				// pure in-memory or read path
+				val, ok := e.store.Apply(req.Cmd)
+				resp.Value = val
+				resp.OK = ok
+				if req.Cmd.Op == "get" {
+					e.gets.Add(1)
+				}
 			}
 
-			switch req.Cmd.Op {
-			case "set":
-				e.sets.Add(1)
-			case "get":
-				e.gets.Add(1)
-			case "delete":
-				e.deletes.Add(1)
-			}
-
-			req.Response <- Response{Value: val, OK: ok}
+			req.Response <- resp
 		}
 	}
 }
@@ -104,6 +127,9 @@ func (e *Engine) Submit(ctx context.Context, cmd Command) (Response, error) {
 	case <-ctx.Done():
 		return Response{}, ctx.Err()
 	case resp := <-respCh:
+		if resp.Err != nil {
+			return resp, resp.Err
+		}
 		return resp, nil
 	}
 }
@@ -130,4 +156,22 @@ func (e *Engine) Stats() Stats {
 		Gets:    e.gets.Load(),
 		Deletes: e.deletes.Load(),
 	}
+}
+
+func (e *Engine) StartApplyLoop(ctx context.Context) {
+	if e.raft == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case entry := <-e.raft.ApplyCh():
+				if cmd, ok := entry.Cmd.(Command); ok {
+					e.store.Apply(cmd)
+				}
+			}
+		}
+	}()
 }
