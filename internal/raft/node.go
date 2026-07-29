@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -238,17 +239,47 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	if args.Term < n.currentTerm {
 		return reply
 	}
-	if args.Term > n.currentTerm || n.state == Candidate {
+	if args.Term > n.currentTerm || n.state != Follower {
 		n.becomeFollower(args.Term)
 	}
 
-	// This is a heartbeat (or will become real replication later).
-	// For now we just accept it and reset the election timer.
+	// Reset election timer – we heard from a legitimate leader
 	n.resetElectionTimeout()
+
+	// Consistency check
+	if args.PrevLogIndex > 0 {
+		e, ok := n.log.At(args.PrevLogIndex)
+		if !ok || e.Term != args.PrevLogTerm {
+			return reply // reject → leader will back off nextIndex
+		}
+	}
+
+	// Append new entries (truncate any conflict first)
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + uint64(i) + 1
+		existing, ok := n.log.At(idx)
+		if ok && existing.Term != entry.Term {
+			_ = n.log.Truncate(idx) // remove conflicting suffix
+			ok = false
+		}
+		if !ok {
+			_, _ = n.log.Append(entry)
+		}
+	}
+
+	// Advance commitIndex
+	if args.LeaderCommit > n.commitIndex {
+		last := n.log.LastIndex()
+		if args.LeaderCommit < last {
+			n.commitIndex = args.LeaderCommit
+		} else {
+			n.commitIndex = last
+		}
+		n.applyCommitted()
+	}
+
 	reply.Success = true
 	reply.Term = n.currentTerm
-
-	// LeaderCommit handling will come with real replication
 	return reply
 }
 
@@ -300,4 +331,159 @@ func (n *Node) Term() uint64 {
 
 func (n *Node) ID() NodeID {
 	return n.id
+}
+
+// ----------- Propose and Replication Logic ----------
+// Propose is called by an upper layer (later engine)
+// Only the leader can accept
+// For now: optimistic accept of proposal, later will wait for commit
+func (n *Node) Propose(cmd any) (index uint64, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return 0, ErrNotLeader
+	}
+
+	entry := Entry{
+		Term: n.currentTerm,
+		Cmd:  cmd,
+	}
+	last, err := n.log.Append(entry)
+	if err != nil {
+		return 0, err
+	}
+
+	n.broadcastAppendEntries()
+	return last, nil
+}
+
+var ErrNotLeader = fmt.Errorf("not leader")
+
+// broadcastAppendEntries sends entries or heartbeats to peers
+func (n *Node) broadcastAppendEntries() {
+	for _, peer := range n.config.Peers {
+		if peer.ID == n.id {
+			continue
+		}
+		n.sendAppendEntries(peer.ID)
+	}
+}
+
+func (n *Node) sendAppendEntries(to NodeID) {
+	next := n.nextIndex[to]
+	prevIndex := next - 1
+	prevTerm := uint64(0)
+	if prevIndex > 0 {
+		if e, ok := n.log.At(prevIndex); ok {
+			prevTerm = e.Term
+		}
+	}
+
+	// Collect entries starting at nextIndex
+	var entries []Entry
+	last := n.log.LastIndex()
+	for i := next; i <= last; i++ {
+		if e, ok := n.log.At(i); ok {
+			entries = append(entries, e)
+		}
+	}
+
+	args := AppendEntriesArgs{
+		Term:         n.currentTerm,
+		LeaderID:     n.id,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
+	}
+
+	go func() {
+		reply, err := n.transport.SendAppendEntries(nil, to, args)
+		if err != nil {
+			return
+		}
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		if reply.Term > n.currentTerm {
+			n.becomeFollower(reply.Term)
+			return
+		}
+		if n.state != Leader || n.currentTerm != args.Term {
+			return
+		}
+
+		if reply.Success {
+			// Update match & next
+			n.matchIndex[to] = args.PrevLogIndex + uint64(len(args.Entries))
+			n.nextIndex[to] = n.matchIndex[to] + 1
+			n.advanceCommitIndex()
+		} else {
+			// Simple backoff (we can make this smarter later)
+			if n.nextIndex[to] > 1 {
+				n.nextIndex[to]--
+			}
+		}
+	}()
+}
+
+// advanceCommitIndex looks for the highest index that is replicated
+// on a majority and has the current term (Raft safety rule).
+func (n *Node) advanceCommitIndex() {
+	last := n.log.LastIndex()
+	for i := n.commitIndex + 1; i <= last; i++ {
+		e, ok := n.log.At(i)
+		if !ok || e.Term != n.currentTerm {
+			continue // only commit current-term entries directly
+		}
+
+		count := 1 // self
+		for _, peer := range n.config.Peers {
+			if peer.ID == n.id {
+				continue
+			}
+			if n.matchIndex[peer.ID] >= i {
+				count++
+			}
+		}
+		if count >= n.config.Majority() {
+			n.commitIndex = i
+		}
+	}
+
+	// Apply newly committed entries
+	n.applyCommitted()
+}
+
+func (n *Node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		e, ok := n.log.At(n.lastApplied)
+		if !ok {
+			continue
+		}
+		// Non-blocking send; upper layer can read from ApplyCh
+		select {
+		case n.applyCh <- e:
+		default:
+			// drop if full – tests can make the channel larger if needed
+		}
+	}
+}
+
+func (n *Node) ApplyCh() <-chan Entry {
+	return n.applyCh
+}
+
+func (n *Node) CommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
+func (n *Node) LastApplied() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
 }
