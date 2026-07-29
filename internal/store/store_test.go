@@ -55,3 +55,32 @@ func TestConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestMemoryLog(t *testing.T) {
+	l := NewMemoryLog()
+
+	if l.LastIndex() != 0 {
+		t.Fatalf("expected empty log")
+	}
+
+	idx, err := l.Append(Entry{Cmd: Command{Op: "set", Key: "a", Value: "1"}})
+	if err != nil || idx != 1 {
+		t.Fatalf("append 1: idx=%d err=%v", idx, err)
+	}
+	idx, err = l.Append(Entry{Cmd: Command{Op: "set", Key: "b", Value: "2"}})
+	if err != nil || idx != 2 {
+		t.Fatalf("append 2: idx=%d err=%v", idx, err)
+	}
+
+	e, ok := l.At(1)
+	if !ok || e.Cmd.Key != "a" {
+		t.Fatalf("At(1) =%+v", err)
+	}
+
+	if err := l.Truncate(2); err != nil {
+		t.Fatal(err)
+	}
+	if l.LastIndex() != 1 {
+		t.Fatalf("after truncate last index = %d", l.LastIndex())
+	}
+}

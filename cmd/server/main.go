@@ -15,7 +15,8 @@ import (
 )
 
 func main() {
-	engine := store.NewEngine(4)
+	// engine := store.NewEngine(4)
+	engine := store.NewEngineWithLog(4, store.NewMemoryLog())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

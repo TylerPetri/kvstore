@@ -19,6 +19,7 @@ type Response struct {
 
 type Engine struct {
 	store   *Store
+	log     Log
 	reqCh   chan Request
 	workers int
 	wg      sync.WaitGroup
@@ -34,6 +35,12 @@ func NewEngine(workers int) *Engine {
 		reqCh:   make(chan Request, 1024),
 		workers: workers,
 	}
+	return e
+}
+
+func NewEngineWithLog(workers int, log Log) *Engine {
+	e := NewEngine(workers)
+	e.log = log
 	return e
 }
 
@@ -54,7 +61,20 @@ func (e *Engine) worker(ctx context.Context) {
 			if !ok {
 				return
 			}
-			val, ok := e.store.Apply(req.Cmd)
+
+			var val string
+
+			if e.log != nil {
+				entry := Entry{Cmd: req.Cmd}
+				_, err := e.log.Append(entry)
+				if err != nil {
+					req.Response <- Response{Err: err}
+					continue
+				}
+				val, ok = e.store.Apply(req.Cmd) // later will only happen after a commit (real RAFT implementation)
+			} else {
+				val, ok = e.store.Apply(req.Cmd)
+			}
 
 			switch req.Cmd.Op {
 			case "set":
