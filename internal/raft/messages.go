@@ -2,10 +2,10 @@ package raft
 
 // ----------- Request Vote -----------
 type RequestVoteArgs struct {
-	Term          uint64
-	CandidateID   NodeID
-	LastVoteIndex uint64
-	LastVoteTerm  uint64
+	Term         uint64
+	CandidateID  NodeID
+	LastLogIndex uint64
+	LastLogTerm  uint64
 }
 
 type RequestVoteReply struct {
@@ -31,5 +31,5 @@ type AppendEntriesReply struct {
 type Entry struct {
 	Index uint64
 	Term  uint64
-	Cmd   string
+	Cmd   any // palceholder
 }
