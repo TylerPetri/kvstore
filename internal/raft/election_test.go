@@ -5,42 +5,10 @@ import (
 	"time"
 )
 
-func newTestCluster(t *testing.T) ([]*Node, *InProcessTransport) {
-	t.Helper()
-
-	ids := []NodeID{"n1", "n2", "n3"}
-	peers := []Peer{
-		{ID: "n1"},
-		{ID: "n2"},
-		{ID: "n3"},
-	}
-
-	tr := NewInProcessTransport()
-	nodes := make([]*Node, 0, 3)
-
-	for _, id := range ids {
-		cfg := Config{
-			ID:            id,
-			Peers:         peers,
-			ElectionTick:  10, // relatively fast for tests
-			HeartbeatTick: 3,
-		}
-		log := NewMemoryLog()
-		n := NewNode(cfg, tr, log)
-		tr.Register(n)
-		nodes = append(nodes, n)
-	}
-
-	for _, n := range nodes {
-		n.Start()
-	}
-	return nodes, tr
-}
-
 func TestElection(t *testing.T) {
-	nodes, _ := newTestCluster(t)
+	cluster := newTestCluster(t)
 	defer func() {
-		for _, n := range nodes {
+		for _, n := range cluster.nodes {
 			n.Stop()
 		}
 	}()
@@ -50,7 +18,7 @@ func TestElection(t *testing.T) {
 	var leader *Node
 	for time.Now().Before(deadline) {
 		leaders := 0
-		for _, n := range nodes {
+		for _, n := range cluster.nodes {
 			if n.State() == Leader {
 				leaders++
 				leader = n
@@ -75,7 +43,7 @@ func TestElection(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	stillLeader := 0
-	for _, n := range nodes {
+	for _, n := range cluster.nodes {
 		if n.State() == Leader {
 			stillLeader++
 			if n.ID() != leader.ID() {

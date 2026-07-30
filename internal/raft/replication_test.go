@@ -6,9 +6,9 @@ import (
 )
 
 func TestReplication(t *testing.T) {
-	nodes, _ := newTestCluster(t)
+	cluster := newTestCluster(t)
 	defer func() {
-		for _, n := range nodes {
+		for _, n := range cluster.nodes {
 			n.Stop()
 		}
 	}()
@@ -17,7 +17,7 @@ func TestReplication(t *testing.T) {
 	var leader *Node
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, n := range nodes {
+		for _, n := range cluster.nodes {
 			if n.State() == Leader {
 				leader = n
 				break
@@ -47,7 +47,7 @@ func TestReplication(t *testing.T) {
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		allDone := true
-		for _, n := range nodes {
+		for _, n := range cluster.nodes {
 			if n.CommitIndex() < 3 || n.LastApplied() < 3 {
 				allDone = false
 				break
@@ -59,14 +59,14 @@ func TestReplication(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	for _, n := range nodes {
+	for _, n := range cluster.nodes {
 		if n.CommitIndex() != 3 || n.LastApplied() != 3 {
 			t.Errorf("node %s: commit=%d applied=%d", n.ID(), n.CommitIndex(), n.LastApplied())
 		}
 	}
 
 	// Drain apply channels and check order (optional but nice)
-	for _, n := range nodes {
+	for _, n := range cluster.nodes {
 		applied := make([]string, 0, 3)
 		timeout := time.After(500 * time.Millisecond)
 	loop:
