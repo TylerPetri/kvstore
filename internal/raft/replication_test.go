@@ -36,7 +36,7 @@ func TestReplication(t *testing.T) {
 	// Propose a few commands
 	cmds := []string{"set a=1", "set b=2", "set c=3"}
 	for _, cmd := range cmds {
-		idx, err := leader.Propose(cmd)
+		idx, err := leader.Propose(t.Context(), cmd)
 		if err != nil {
 			t.Fatalf("Propose: %v", err)
 		}

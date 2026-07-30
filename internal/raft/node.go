@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -54,6 +55,11 @@ type Node struct {
 
 	stopCh  chan struct{}
 	applyCh chan Entry // unused until replication
+
+	pendingMu sync.Mutex
+	pending   map[uint64]chan struct{}
+
+	leaderLost chan struct{}
 }
 
 func NewNode(cfg Config, transport Transport, log Log) *Node {
@@ -67,6 +73,8 @@ func NewNode(cfg Config, transport Transport, log Log) *Node {
 		matchIndex: make(map[NodeID]uint64),
 		stopCh:     make(chan struct{}),
 		applyCh:    make(chan Entry, 64),
+		pending:    make(map[uint64]chan struct{}),
+		leaderLost: make(chan struct{}),
 	}
 	n.resetElectionTimeout()
 	return n
@@ -189,10 +197,15 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) becomeFollower(term uint64) {
+	wasLeader := n.state == Leader
 	n.state = Follower
 	n.currentTerm = term
 	n.votedFor = ""
 	n.resetElectionTimeout()
+
+	if wasLeader {
+		n.notifyLeaderLost()
+	}
 }
 
 // ---------- RPCs ----------
@@ -337,11 +350,11 @@ func (n *Node) ID() NodeID {
 // Propose is called by an upper layer (later engine)
 // Only the leader can accept
 // For now: optimistic accept of proposal, later will wait for commit
-func (n *Node) Propose(cmd any) (index uint64, err error) {
+func (n *Node) Propose(ctx context.Context, cmd any) (index uint64, err error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	if n.state != Leader {
+		n.mu.Unlock()
 		return 0, ErrNotLeader
 	}
 
@@ -349,13 +362,57 @@ func (n *Node) Propose(cmd any) (index uint64, err error) {
 		Term: n.currentTerm,
 		Cmd:  cmd,
 	}
-	last, err := n.log.Append(entry)
+	index, err = n.log.Append(entry)
 	if err != nil {
+		n.mu.Unlock()
 		return 0, err
 	}
 
+	// Register a waiter before we unlock
+	waitCh := make(chan struct{})
+	n.pendingMu.Lock()
+	n.pending[index] = waitCh
+	lostCh := n.leaderLost
+	n.pendingMu.Unlock()
+
+	// Kick replication
 	n.broadcastAppendEntries()
-	return last, nil
+	n.mu.Unlock()
+
+	// Wait for apply (or cancellation / leadership loss)
+	select {
+	case <-ctx.Done():
+		n.cleanupPending(index)
+		return 0, ctx.Err()
+	case <-waitCh:
+		return index, nil
+	case <-lostCh:
+		n.cleanupPending(index)
+		return 0, ErrNotLeader
+	}
+}
+
+func (n *Node) cleanupPending(index uint64) {
+	n.pendingMu.Lock()
+	defer n.pendingMu.Unlock()
+	if ch, ok := n.pending[index]; ok {
+		delete(n.pending, index)
+		// do not close - the apply side my still try to close it
+		_ = ch
+	}
+}
+
+func (n *Node) notifyLeaderLost() {
+	n.pendingMu.Lock()
+	defer n.pendingMu.Unlock()
+
+	close(n.leaderLost)
+	n.leaderLost = make(chan struct{})
+
+	for idx, ch := range n.pending {
+		close(ch)
+		delete(n.pending, idx)
+	}
 }
 
 var ErrNotLeader = fmt.Errorf("not leader")
@@ -463,7 +520,14 @@ func (n *Node) applyCommitted() {
 		if !ok {
 			continue
 		}
-		// Non-blocking send; upper layer can read from ApplyCh
+
+		n.pendingMu.Lock()
+		if ch, exists := n.pending[n.lastApplied]; exists {
+			close(ch)
+			delete(n.pending, n.lastApplied)
+		}
+		n.pendingMu.Unlock()
+
 		select {
 		case n.applyCh <- e:
 		default:

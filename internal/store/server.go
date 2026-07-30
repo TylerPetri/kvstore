@@ -9,6 +9,7 @@ import (
 )
 
 type Request struct {
+	Ctx      context.Context
 	Cmd      Command
 	Response chan Response
 }
@@ -75,7 +76,7 @@ func (e *Engine) worker(ctx context.Context) {
 
 			switch {
 			case e.raft != nil && (req.Cmd.Op == "set" || req.Cmd.Op == "delete"):
-				_, err := e.raft.Propose(req.Cmd)
+				_, err := e.raft.Propose(req.Ctx, req.Cmd)
 				if err != nil {
 					resp.Err = err
 				} else {
@@ -115,7 +116,7 @@ func (e *Engine) worker(ctx context.Context) {
 
 func (e *Engine) Submit(ctx context.Context, cmd Command) (Response, error) {
 	respCh := make(chan Response, 1)
-	req := Request{Cmd: cmd, Response: respCh}
+	req := Request{Ctx: ctx, Cmd: cmd, Response: respCh}
 
 	select {
 	case <-ctx.Done():
