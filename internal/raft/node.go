@@ -60,6 +60,8 @@ type Node struct {
 	pending   map[uint64]chan struct{}
 
 	leaderLost chan struct{}
+
+	currentLeader NodeID
 }
 
 func NewNode(cfg Config, transport Transport, log Log) *Node {
@@ -201,6 +203,7 @@ func (n *Node) becomeFollower(term uint64) {
 	n.state = Follower
 	n.currentTerm = term
 	n.votedFor = ""
+	n.currentLeader = ""
 	n.resetElectionTimeout()
 
 	if wasLeader {
@@ -257,6 +260,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	}
 
 	// Reset election timer – we heard from a legitimate leader
+	n.currentLeader = args.LeaderID
 	n.resetElectionTimeout()
 
 	// Consistency check
@@ -550,4 +554,18 @@ func (n *Node) LastApplied() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.lastApplied
+}
+
+func (n *Node) LeaderID() NodeID {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	switch n.state {
+	case Leader:
+		return n.id
+	case Follower, Candidate:
+		return n.currentLeader
+	default:
+		return ""
+	}
 }
