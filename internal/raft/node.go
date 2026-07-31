@@ -38,6 +38,7 @@ type Node struct {
 	currentTerm uint64
 	votedFor    NodeID
 	log         Log
+	storage     Storage
 
 	commitIndex uint64
 	lastApplied uint64
@@ -80,6 +81,28 @@ func NewNode(cfg Config, transport Transport, log Log) *Node {
 	}
 	n.resetElectionTimeout()
 	return n
+}
+
+func NewNodeWithStorage(cfg Config, transport Transport, storage Storage) (*Node, error) {
+	term, votedFor, err := storage.State()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := storage.Log()
+	if err != nil {
+		return nil, err
+	}
+
+	log := NewMemoryLog()
+	if len(log.entries) > 1 {
+		_, _ = log.Append(entries[1:]...)
+	}
+
+	n := NewNode(cfg, transport, log)
+	n.currentTerm = term
+	n.votedFor = votedFor
+	n.storage = storage // add field: storage Storage
+	return n, nil
 }
 
 func (n *Node) resetElectionTimeout() {
@@ -156,7 +179,9 @@ func (n *Node) startElection() {
 				LastLogIndex: lastIndex,
 				LastLogTerm:  lastTerm,
 			}
-			reply, err := n.transport.SendRequestVote(nil, to, args)
+			ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+			defer cancel()
+			reply, err := n.transport.SendRequestVote(ctx, to, args)
 			if err != nil {
 				return
 			}
@@ -188,6 +213,10 @@ func (n *Node) becomeLeader() {
 	n.state = Leader
 	n.heartbeatElapsed = 0
 
+	if n.storage != nil {
+		_ = n.storage.SaveState(n.currentTerm, n.votedFor)
+	}
+
 	last := n.log.LastIndex()
 	for _, peer := range n.config.Peers {
 		n.nextIndex[peer.ID] = last + 1
@@ -205,6 +234,10 @@ func (n *Node) becomeFollower(term uint64) {
 	n.votedFor = ""
 	n.currentLeader = ""
 	n.resetElectionTimeout()
+
+	if n.storage != nil {
+		_ = n.storage.SaveState(n.currentTerm, n.votedFor)
+	}
 
 	if wasLeader {
 		n.notifyLeaderLost()
@@ -295,6 +328,18 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		n.applyCommitted()
 	}
 
+	if n.storage != nil {
+		// TODO: less naive; this works for now
+		entries := make([]Entry, 0, n.log.LastIndex()+1)
+		entries = append(entries, Entry{}) // index 0
+		for i := uint64(1); i <= n.log.LastIndex(); i++ {
+			if e, ok := n.log.At(1); ok {
+				entries = append(entries, e)
+			}
+		}
+		_ = n.storage.SaveLog(entries)
+	}
+
 	reply.Success = true
 	reply.Term = n.currentTerm
 	return reply
@@ -319,7 +364,9 @@ func (n *Node) broadcastHeartbeat() {
 				Entries:      nil, // heartbeat
 				LeaderCommit: commit,
 			}
-			reply, err := n.transport.SendAppendEntries(nil, to, args)
+			ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+			defer cancel()
+			reply, err := n.transport.SendAppendEntries(ctx, to, args)
 			if err != nil {
 				return
 			}
@@ -460,7 +507,9 @@ func (n *Node) sendAppendEntries(to NodeID) {
 	}
 
 	go func() {
-		reply, err := n.transport.SendAppendEntries(nil, to, args)
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer cancel()
+		reply, err := n.transport.SendAppendEntries(ctx, to, args)
 		if err != nil {
 			return
 		}

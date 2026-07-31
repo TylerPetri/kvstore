@@ -1,0 +1,60 @@
+# ----- Runtime data (Raft persistence) -----
+/data/
+data/
+
+# ----- Build artifacts -----
+/bin/
+/dist/
+/tmp/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+
+# ----- Go -----
+# dependency dir
+/vendor/
+
+# go workspace file
+go.work
+go.work.sum
+
+# test coverage
+coverage.out
+coverage.html
+*.coverprofile
+*.cgo1.go
+*.cgo2.c
+_cgo_export.h
+_cgo_gotypes.go
+_cgo_main.c
+
+# ----- IDE / editor -----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# ----- Logs & debug -----
+*.log
+*.pprof
+debug
+trace.out
+
+# ----- OS junk -----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ----- Optional local env / secrets -----
+.env
+.env.*
+!.env.example

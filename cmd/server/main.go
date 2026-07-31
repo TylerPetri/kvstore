@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/TylerPetri/kvstore/internal/store"
 )
 
+// Single source of truth for the demo cluster.
 var nodeAddrs = map[raft.NodeID]string{
 	"n1": "http://localhost:8081",
 	"n2": "http://localhost:8082",
@@ -26,19 +29,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ----- Build peer list and port list from nodeAddrs -----
-	var peers []raft.Peer
-	for id, addr := range nodeAddrs {
-		peers = append(peers, raft.Peer{
-			ID:   id,
-			Addr: addr, // stored for later real-network transport
-		})
-	}
-
-	tr := raft.NewInProcessTransport()
-
+	// ----- Build peer list from nodeAddrs -----
 	nodes := make(map[raft.NodeID]*raft.Node)
 	engines := make(map[raft.NodeID]*store.Engine)
+	var peers []raft.Peer
+	for id, addr := range nodeAddrs {
+		peers = append(peers, raft.Peer{ID: id, Addr: addr})
+	}
+	tr := raft.NewHTTPTransport(nodeAddrs)
 
 	// ----- Create & start every Raft node + Engine -----
 	for id := range nodeAddrs {
@@ -48,9 +46,18 @@ func main() {
 			ElectionTick:  10,
 			HeartbeatTick: 3,
 		}
-		rlog := raft.NewMemoryLog()
-		n := raft.NewNode(cfg, tr, rlog)
-		tr.Register(n)
+
+		// Persistent storage per node
+		dir := filepath.Join("data", string(id))
+		storage, err := raft.NewFileStorage(dir)
+		if err != nil {
+			log.Fatalf("storage for %s: %v", id, err)
+		}
+
+		n, err := raft.NewNodeWithStorage(cfg, tr, storage)
+		if err != nil {
+			log.Fatalf("node %s: %v", id, err)
+		}
 		n.Start()
 		nodes[id] = n
 
@@ -60,11 +67,11 @@ func main() {
 		engines[id] = eng
 	}
 
-	// ----- HTTP servers (one per node) -----
+	// ----- HTTP servers (KV API + Raft RPCs) -----
 	servers := make([]*http.Server, 0, len(nodeAddrs))
 	for id, fullAddr := range nodeAddrs {
-		id := id                   // capture
-		addr := portOnly(fullAddr) // ":8081", ":8082", ...
+		id := id // capture
+		addr := portOnly(fullAddr)
 
 		mux := http.NewServeMux()
 		attachHandlers(mux, engines[id], nodes[id])
@@ -117,19 +124,31 @@ func portOnly(full string) string {
 }
 
 func attachHandlers(mux *http.ServeMux, eng *store.Engine, node *raft.Node) {
-	// ---------- /set (with transparent proxy) ----------
+	// -------------------- KV API --------------------
+
+	// POST /set  (with transparent proxy to leader)
 	mux.HandleFunc("/set", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
+		// ---- 1. Read body exactly once ----
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.Body.Close()
+
+		log.Printf("[%s] /set received %d bytes: %s", node.ID(), len(bodyBytes), string(bodyBytes))
+
 		var body struct {
 			Key   string `json:"key"`
 			Value string `json:"value"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if body.Key == "" {
@@ -139,67 +158,74 @@ func attachHandlers(mux *http.ServeMux, eng *store.Engine, node *raft.Node) {
 
 		cmd := store.Command{Op: "set", Key: body.Key, Value: body.Value}
 
-		// Try locally first
-		_, err := eng.Submit(r.Context(), cmd)
+		// ---- 2. Try local engine ----
+		_, err = eng.Submit(r.Context(), cmd)
 		if err == nil {
+			log.Printf("[%s] local submit succeeded", node.ID())
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
 		}
 
 		if err != raft.ErrNotLeader {
+			log.Printf("[%s] local submit error: %v", node.ID(), err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Not leader → proxy or redirect
+		// ---- 3. Real HTTP proxy to leader ----
 		leaderID := node.LeaderID()
-		if leaderID == "" {
+		log.Printf("[%s] not leader, current leader = %q", node.ID(), leaderID)
+
+		if leaderID == "" || leaderID == node.ID() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]string{
-				"error": "not leader, leader unknown",
+				"error": "not leader, leader unknown or self",
 			})
 			return
 		}
 
 		leaderAddr, ok := nodeAddrs[leaderID]
 		if !ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":  "not leader",
-				"leader": string(leaderID),
-			})
+			http.Error(w, "unknown leader address", http.StatusInternalServerError)
 			return
 		}
 
-		// Transparent proxy
+		proxyURL := leaderAddr + "/set"
+		log.Printf("[%s] proxying to %s", node.ID(), proxyURL)
+
 		proxyReq, err := http.NewRequestWithContext(
 			r.Context(),
 			http.MethodPost,
-			leaderAddr+"/set",
-			r.Body,
+			proxyURL,
+			bytes.NewReader(bodyBytes), // fresh reader every time
 		)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "create proxy req: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		proxyReq.Header.Set("Content-Type", "application/json")
+		proxyReq.ContentLength = int64(len(bodyBytes))
 
-		proxyResp, err := http.DefaultClient.Do(proxyReq)
+		client := &http.Client{Timeout: 3 * time.Second}
+		proxyResp, err := client.Do(proxyReq)
 		if err != nil {
-			http.Error(w, "proxy to leader failed: "+err.Error(), http.StatusBadGateway)
+			log.Printf("[%s] proxy transport error: %v", node.ID(), err)
+			http.Error(w, "proxy failed: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer proxyResp.Body.Close()
 
+		respBody, _ := io.ReadAll(proxyResp.Body)
+		log.Printf("[%s] proxy response %d: %s", node.ID(), proxyResp.StatusCode, string(respBody))
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(proxyResp.StatusCode)
-		io.Copy(w, proxyResp.Body)
+		w.Write(respBody)
 	})
 
-	// ---------- /get ----------
+	// GET /get?key=...
 	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -228,13 +254,13 @@ func attachHandlers(mux *http.ServeMux, eng *store.Engine, node *raft.Node) {
 		})
 	})
 
-	// ---------- /stats ----------
+	// GET /stats
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(eng.Stats())
 	})
 
-	// ---------- /raft (debug) ----------
+	// GET /raft  (debug)
 	mux.HandleFunc("/raft", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
@@ -247,8 +273,40 @@ func attachHandlers(mux *http.ServeMux, eng *store.Engine, node *raft.Node) {
 		})
 	})
 
-	// ---------- /health ----------
+	// GET /health
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
+	})
+
+	// -------------------- Raft RPCs --------------------
+
+	mux.HandleFunc("/raft/requestvote", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var args raft.RequestVoteArgs
+		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reply := node.HandleRequestVote(args)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(reply)
+	})
+
+	mux.HandleFunc("/raft/appendentries", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var args raft.AppendEntriesArgs
+		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		reply := node.HandleAppendEntries(args)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(reply)
 	})
 }
